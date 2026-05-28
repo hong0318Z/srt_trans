@@ -166,15 +166,27 @@ class SRTTranslator:
             max_tokens=1024,
         )
 
+    # ── 레이블 제거 ──────────────────────────────────────────────────────────
+
+    def _strip_labels(self, text: str) -> str:
+        """OCR 레이블 문자열을 텍스트에서 제거 후 정리된 텍스트 반환."""
+        result = text
+        for label in self.excluded_labels:
+            l = label.strip()
+            if len(l) >= 2:           # 2자 미만 레이블은 무시 (과잉 제거 방지)
+                result = result.replace(l, '')
+        lines = [ln.strip() for ln in result.splitlines() if ln.strip()]
+        return '\n'.join(lines)
+
     # ── 샘플 번역 ────────────────────────────────────────────────────────────
 
     def translate_sample(self, blocks: List[SubtitleBlock], n: int = 5) -> str:
-        excluded = set(self.excluded_labels)
-        sample   = [b for b in blocks if b.text.strip() not in excluded][:n]
+        sample = [b for b in blocks if self._strip_labels(b.text)][:n * 3]
+        sample = sample[:n]
         if not sample:
             return '(샘플 자막 없음)'
-        result = self.translate_batch(sample, [])
-        lines  = []
+        result, _, _ = self.translate_batch(sample, [])
+        lines = []
         for i, block in enumerate(sample, 1):
             trans = result.get(str(i), '(번역 실패)')
             lines.append(
@@ -188,9 +200,10 @@ class SRTTranslator:
 
     def translate_batch(self, blocks: List[SubtitleBlock],
                         prev_context: List[tuple],
-                        on_chunk: Callable = None) -> Dict[str, str]:
+                        on_chunk: Callable = None) -> tuple:
+        """레이블을 제거한 뒤 번역. 반환: ({str(1..n): trans_or_empty}, tok_in, tok_out)
+        빈 문자열 = 레이블 전용 블록 (출력 파일에서 생략)."""
         noun_str = '\n'.join(f'  {k} → {v}' for k, v in self.proper_nouns.items()) or '없음'
-        excl_str = ', '.join(f'"{l}"' for l in self.excluded_labels) or '없음'
 
         system = (
             TRANSLATION_SYSTEM_PROMPT
@@ -198,30 +211,43 @@ class SRTTranslator:
             + f"소스 언어: {self.source_lang}\n"
             + f"내용: {self.work_summary}\n"
             + f"\n=== 고유명사 사전 (반드시 이 번역을 사용) ===\n{noun_str}\n"
-            + f"\n=== OCR 레이블 (번역 출력에서 제외) ===\n{excl_str}\n"
         )
         if self.extra_instructions:
             system += f"\n=== 추가 지시사항 ===\n{self.extra_instructions}\n"
-
         system += (
             '\n=== 출력 형식 (엄수) ===\n'
             '반드시 JSON만 출력: {"1": "번역1", "2": "번역2", ...}\n'
-            'OCR 레이블에 해당하는 블록은 해당 키를 생략하세요.\n'
             '각 번역은 줄바꿈 없이 한 줄로 작성하세요.'
         )
+
+        # 레이블 제거 후 비어있는 블록은 건너뜀 (키 보존)
+        # seq_items: [(orig_1based_key, cleaned_text, block), ...]
+        seq_items  = []
+        empty_keys = set()
+        for j, block in enumerate(blocks):
+            cleaned = self._strip_labels(block.text)
+            if cleaned:
+                seq_items.append((str(j + 1), cleaned, block))
+            else:
+                empty_keys.add(str(j + 1))
+
+        result: Dict[str, str] = {k: '' for k in empty_keys}
+        if not seq_items:
+            return result, 0, 0
 
         ctx_str = '\n'.join(
             f"[원] {o}\n[번] {t}"
             for o, t in prev_context[-CONTEXT_TAIL:]
         ) or '(첫 번째 배치)'
 
+        # LLM에는 1부터 순서대로 번호 매김
         batch_str = '\n'.join(
-            f"{i+1}. [{b.start}] {b.text}"
-            for i, b in enumerate(blocks)
+            f"{seq+1}. [{block.start}] {cleaned}"
+            for seq, (_, cleaned, block) in enumerate(seq_items)
         )
         user = (
             f"=== 이전 번역 컨텍스트 ===\n{ctx_str}\n\n"
-            f"=== 번역할 자막 ({len(blocks)}개) ===\n{batch_str}\n\n"
+            f"=== 번역할 자막 ({len(seq_items)}개) ===\n{batch_str}\n\n"
             "위를 한국어로 번역하세요. JSON만 출력:"
         )
 
@@ -233,13 +259,58 @@ class SRTTranslator:
                 on_chunk=on_chunk,
             )
             content = _strip_code_fence(content)
-            brace = content.find('{')
+            brace   = content.find('{')
             if brace > 0:
                 content = content[brace:]
-            return json.loads(content.strip()), tok_in, tok_out
+            llm_map = json.loads(content.strip())
+            # 순차 번호 → 원래 키 매핑
+            for seq, (orig_key, _, _) in enumerate(seq_items):
+                result[orig_key] = llm_map.get(str(seq + 1), '')
+            return result, tok_in, tok_out
         except Exception as e:
             print(f"translate_batch error: {e}")
-            return {}, 0, 0
+            return result, 0, 0
+
+    # ── 자막 정리 분석 ───────────────────────────────────────────────────────
+
+    def cleanup_analyze(self, blocks: List[SubtitleBlock]) -> dict:
+        """전체 자막에서 노이즈/레이블 패턴을 감지해 반환.
+        반환 dict에 '_tok_in', '_tok_out' 포함."""
+        # 빈도순 중복 제거 텍스트 목록
+        from collections import Counter
+        counts = Counter(b.text.strip() for b in blocks if b.text.strip())
+        lines  = '\n'.join(
+            f"[{cnt}회] {text}"
+            for text, cnt in counts.most_common(600)
+        )
+        prompt = (
+            '아래는 SRT 자막 파일의 고유 텍스트 목록입니다 (대괄호 안은 등장 횟수).\n'
+            '실제 대사가 아닌 노이즈·레이블·워터마크 텍스트를 찾아주세요.\n\n'
+            '판단 기준:\n'
+            '1. 반복 등장하는 고정 텍스트 (방송국명, 제작사, 워터마크)\n'
+            '2. 숫자·특수문자로만 구성된 비대화 텍스트\n'
+            '3. 명백한 OCR 오류 패턴\n'
+            '4. 전체 맥락과 무관한 삽입 텍스트\n\n'
+            '반드시 JSON만 출력:\n'
+            '{\n'
+            '  "patterns": [\n'
+            '    {"text": "정확한 원문 텍스트", "reason": "이유", "count": 등장횟수}\n'
+            '  ],\n'
+            '  "summary": "200자 이내 분석 요약"\n'
+            '}\n\n'
+            f'자막 텍스트 목록:\n{lines}'
+        )
+        raw, tok_in, tok_out = self.client._chat_tracked(
+            [{'role': 'system',
+              'content': '당신은 자막 노이즈 분석 전문가입니다. JSON만 출력하세요.'},
+             {'role': 'user', 'content': prompt}],
+            max_tokens=4096,
+        )
+        raw    = _strip_code_fence(raw)
+        result = json.loads(raw.strip())
+        result['_tok_in']  = tok_in
+        result['_tok_out'] = tok_out
+        return result
 
 
 def _strip_code_fence(text: str) -> str:

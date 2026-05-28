@@ -83,3 +83,11 @@ def write_ko_srt(blocks: List[SubtitleBlock], translated: List[str], filepath: s
         lines.extend([str(seq), f"{block.start} --> {block.end}", trans, ''])
         seq += 1
     Path(filepath).write_text('\n'.join(lines), encoding='utf-8')
+
+
+def write_cleaned_srt(blocks: List[SubtitleBlock], filepath: str):
+    """Write SRT after cleanup (overwrite). Re-numbers sequentially."""
+    lines = []
+    for i, block in enumerate(blocks, 1):
+        lines.extend([str(i), f"{block.start} --> {block.end}", block.text, ''])
+    Path(filepath).write_text('\n'.join(lines), encoding='utf-8')
