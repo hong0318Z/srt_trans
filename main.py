@@ -26,6 +26,7 @@ P_TRANS    = 4
 P_REVIEW   = 5
 P_DONE     = 6
 P_CLEANUP  = 7
+P_MISSING  = 8
 
 # ── Stylesheet ────────────────────────────────────────────────────────────────
 STYLE = """
@@ -290,11 +291,13 @@ class SetupPage(QWidget):
         btn_row = QHBoxLayout()
         self.cleanup_btn = _btn('자막 정리 (노이즈 제거)', 'secondary')
         self.cleanup_btn.setEnabled(False)
-        self.start_btn = _btn('  번역 분석 시작  →')
+        self.missing_btn = _btn('미번역 목록', 'secondary')
+        self.start_btn   = _btn('  번역 분석 시작  →')
         self.start_btn.setEnabled(False)
-        self.start_btn.setFixedHeight(44)
-        self.cleanup_btn.setFixedHeight(44)
+        for b in (self.cleanup_btn, self.missing_btn, self.start_btn):
+            b.setFixedHeight(44)
         btn_row.addWidget(self.cleanup_btn)
+        btn_row.addWidget(self.missing_btn)
         btn_row.addStretch()
         btn_row.addWidget(self.start_btn)
         root.addLayout(btn_row)
@@ -304,6 +307,8 @@ class SetupPage(QWidget):
         self.test_btn.clicked.connect(self._test)
         self.start_btn.clicked.connect(self.main.start_analysis)
         self.cleanup_btn.clicked.connect(self.main.start_cleanup)
+        self.missing_btn.clicked.connect(
+            lambda: self.main.stack.setCurrentIndex(P_MISSING))
         self.token_edit.textChanged.connect(self._check_ready)
         self.batch_spin.valueChanged.connect(
             lambda v: self.main.settings.setValue('batch_size', v))
@@ -324,6 +329,8 @@ class SetupPage(QWidget):
         ok = bool(self.token_edit.text().strip() and self.main.srt_path)
         self.start_btn.setEnabled(ok)
         self.cleanup_btn.setEnabled(ok)
+        # 미번역 목록은 파일 없이도 사용 가능 (디렉토리만 지정)
+        self.missing_btn.setEnabled(True)
 
     def _test(self):
         token = self.token_edit.text().strip()
@@ -897,6 +904,170 @@ class CleanupReviewPage(QWidget):
         return selected
 
 
+class MissingPage(QWidget):
+    """두 디렉토리를 지정해 .ko.srt 가 없는 파일 목록을 표시."""
+
+    # 알려진 언어 접미사 (확장자 제외)
+    _LANG_TAGS = {'.ko', '.zh', '.en', '.ja', '.cn', '.chs', '.cht',
+                  '.sc', '.tc', '.chi', '.jpn', '.eng'}
+
+    def __init__(self, main_win):
+        super().__init__()
+        self.main = main_win
+        self._build()
+
+    def _build(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(40, 24, 40, 24)
+        lay.setSpacing(14)
+
+        lay.addWidget(_label('미번역 목록', 'title'))
+        sub = _label('.ko.srt 파일이 없는 자막을 찾습니다.')
+        sub.setStyleSheet('color:#a6adc8;')
+        lay.addWidget(sub)
+        lay.addWidget(_h_sep())
+
+        # Dir 1 – source
+        lay.addWidget(_label('원본 SRT 디렉토리 (필수)'))
+        d1_row = QHBoxLayout()
+        self.dir1_lbl = _label('선택 안 됨')
+        self.dir1_lbl.setStyleSheet(
+            'color:#a6adc8; background:#313244; border:1px solid #45475a;'
+            'border-radius:5px; padding:6px 10px;')
+        self.dir1_lbl.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        d1_btn = _btn('선택', 'secondary')
+        d1_row.addWidget(self.dir1_lbl); d1_row.addWidget(d1_btn)
+        lay.addLayout(d1_row)
+
+        # Dir 2 – translation (optional)
+        lay.addWidget(_label('번역본 디렉토리 (비워두면 원본과 동일)'))
+        d2_row = QHBoxLayout()
+        self.dir2_lbl = _label('선택 안 됨 (원본과 같은 디렉토리)')
+        self.dir2_lbl.setStyleSheet(
+            'color:#a6adc8; background:#313244; border:1px solid #45475a;'
+            'border-radius:5px; padding:6px 10px;')
+        self.dir2_lbl.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        d2_btn   = _btn('선택', 'secondary')
+        d2_clear = _btn('초기화', 'secondary')
+        d2_row.addWidget(self.dir2_lbl)
+        d2_row.addWidget(d2_btn)
+        d2_row.addWidget(d2_clear)
+        lay.addLayout(d2_row)
+
+        # Options
+        opt_row = QHBoxLayout()
+        self.recursive_cb = QCheckBox('하위 폴더 포함')
+        self.recursive_cb.setChecked(True)
+        opt_row.addWidget(self.recursive_cb); opt_row.addStretch()
+        lay.addLayout(opt_row)
+
+        # Search button
+        search_row = QHBoxLayout()
+        self.search_btn = _btn('검색')
+        self.search_btn.setFixedHeight(40)
+        search_row.addStretch(); search_row.addWidget(self.search_btn)
+        lay.addLayout(search_row)
+
+        # Result
+        self.result_lbl = _label('')
+        self.result_lbl.setStyleSheet('color:#a6adc8; font-size:12px;')
+        lay.addWidget(self.result_lbl)
+
+        self.list_edit = QTextEdit()
+        self.list_edit.setReadOnly(True)
+        self.list_edit.setPlaceholderText('검색 결과가 여기에 표시됩니다.')
+        lay.addWidget(self.list_edit)
+
+        # Back
+        back_btn = _btn('← 돌아가기', 'secondary')
+        lay.addWidget(back_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        # State
+        self._dir1 = ''
+        self._dir2 = ''
+
+        # Signals
+        d1_btn.clicked.connect(self._pick_dir1)
+        d2_btn.clicked.connect(self._pick_dir2)
+        d2_clear.clicked.connect(self._clear_dir2)
+        self.search_btn.clicked.connect(self._search)
+        back_btn.clicked.connect(
+            lambda: self.main.stack.setCurrentIndex(P_SETUP))
+
+    def _pick_dir1(self):
+        d = QFileDialog.getExistingDirectory(self, '원본 디렉토리 선택')
+        if d:
+            self._dir1 = d
+            self.dir1_lbl.setText(d)
+
+    def _pick_dir2(self):
+        d = QFileDialog.getExistingDirectory(self, '번역본 디렉토리 선택')
+        if d:
+            self._dir2 = d
+            self.dir2_lbl.setText(d)
+
+    def _clear_dir2(self):
+        self._dir2 = ''
+        self.dir2_lbl.setText('선택 안 됨 (원본과 같은 디렉토리)')
+
+    def _search(self):
+        if not self._dir1:
+            QMessageBox.warning(self, '알림', '원본 디렉토리를 선택하세요.')
+            return
+
+        p1 = Path(self._dir1)
+        p2 = Path(self._dir2) if self._dir2 else None
+
+        pattern = '**/*.srt' if self.recursive_cb.isChecked() else '*.srt'
+        all_srt  = sorted(p1.glob(pattern))
+
+        missing = []
+        for srt in all_srt:
+            # .ko.srt 는 번역 결과물이므로 원본 목록에서 제외
+            if srt.stem.lower().endswith('.ko'):
+                continue
+
+            base = self._base_name(srt.stem)
+
+            # 같은 위치에 .ko.srt 존재 여부 확인
+            rel       = srt.relative_to(p1)
+            same_dir  = srt.parent / f"{base}.ko.srt"
+
+            if p2:
+                # dir2 에서 같은 상대 경로 우선, 그 다음 flat 탐색
+                trans_rel  = p2 / rel.parent / f"{base}.ko.srt"
+                trans_flat = p2 / f"{base}.ko.srt"
+                found = same_dir.exists() or trans_rel.exists() or trans_flat.exists()
+            else:
+                found = same_dir.exists()
+
+            if not found:
+                missing.append(str(srt))
+
+        self.list_edit.clear()
+        if missing:
+            self.result_lbl.setText(
+                f'미번역 파일: {len(missing)}개  /  전체 스캔: {len(all_srt)}개')
+            self.list_edit.setPlainText('\n'.join(missing))
+        else:
+            self.result_lbl.setText(
+                f'모든 파일에 번역본이 존재합니다.  (스캔: {len(all_srt)}개)')
+            self.list_edit.setPlainText('(미번역 파일 없음)')
+
+    @staticmethod
+    def _base_name(stem: str) -> str:
+        """stem 에서 언어 태그 제거 후 기본 이름 반환."""
+        known = {'.ko', '.zh', '.en', '.ja', '.cn', '.chs', '.cht',
+                 '.sc', '.tc', '.chi', '.jpn', '.eng'}
+        low = stem.lower()
+        for tag in known:
+            if low.endswith(tag):
+                return stem[: len(stem) - len(tag)]
+        return stem
+
+
 # ── Main Window ───────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
@@ -927,12 +1098,13 @@ class MainWindow(QMainWindow):
         self.review_page   = ReviewPage(self)
         self.done_page     = DonePage()
         self.cleanup_page  = CleanupReviewPage(self)
+        self.missing_page  = MissingPage(self)
 
         for p in [self.setup_page, self.loading_page, self.analysis_page,
                   self.sample_page, self.trans_page, self.review_page,
-                  self.done_page, self.cleanup_page]:
+                  self.done_page, self.cleanup_page, self.missing_page]:
             self.stack.addWidget(p)
-        # indices: 0=setup 1=loading 2=analysis 3=sample 4=trans 5=review 6=done 7=cleanup
+        # indices: 0=setup 1=loading 2=analysis 3=sample 4=trans 5=review 6=done 7=cleanup 8=missing
 
         self.analysis_page.request_sample.connect(self._show_sample)
         self.analysis_page.request_start.connect(self._begin_translation)
