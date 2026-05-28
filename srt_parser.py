@@ -51,26 +51,25 @@ def parse_srt(filepath: str) -> List[SubtitleBlock]:
     return blocks
 
 
-def get_output_paths(input_path: str, detected_lang_code: str) -> tuple[str, str]:
-    """Returns (source_srt_path, korean_srt_path).
-    If input already has a known language suffix, keeps it; otherwise appends detected code."""
+def get_output_paths(input_path: str, detected_lang_code: str = 'zh') -> tuple[str, str]:
+    """Returns (origin_path, output_srt_path).
+    origin_path: where to move the original file  (dir/origin/original_filename.srt)
+    output_srt_path: output path for the translation  (dir/base.srt, no lang tag)
+    """
     p    = Path(input_path)
-    stem = p.stem
     dir_ = p.parent
 
     known = {'.zh', '.en', '.ja', '.ko', '.cn', '.chs', '.cht'}
-    # check if stem ends with a known lang tag
+    stem = p.stem
     base = stem
     for tag in known:
         if stem.lower().endswith(tag):
-            base = stem[:len(stem)-len(tag)]
+            base = stem[:len(stem) - len(tag)]
             break
-    else:
-        # no known tag → name source file with detected code
-        src_name = f"{stem}.{detected_lang_code}.srt"
-        return str(dir_ / src_name), str(dir_ / f"{stem}.ko.srt")
 
-    return str(dir_ / f"{base}{tag}.srt"), str(dir_ / f"{base}.ko.srt")
+    origin_path = str(dir_ / 'origin' / p.name)
+    output_path = str(dir_ / f"{base}.srt")
+    return origin_path, output_path
 
 
 def write_ko_srt(blocks: List[SubtitleBlock], translated: List[str], filepath: str):

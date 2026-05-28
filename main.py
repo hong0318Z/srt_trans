@@ -731,10 +731,12 @@ class ReviewPage(QWidget):
 
 
 class DonePage(QWidget):
-    restart = pyqtSignal()
+    restart     = pyqtSignal()
+    cleanup_sig = pyqtSignal(str)   # emits output srt path for post-translation cleanup
 
     def __init__(self):
         super().__init__()
+        self._current_path = ''
         self._build()
 
     def _build(self):
@@ -759,20 +761,32 @@ class DonePage(QWidget):
         self.path_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(self.path_lbl)
         lay.addSpacing(30)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(16)
         again_btn = _btn('다른 파일 번역하기')
-        lay.addWidget(again_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+        self.cleanup_btn = _btn('노이즈 제거', 'secondary')
+        btn_row.addWidget(again_btn)
+        btn_row.addWidget(self.cleanup_btn)
+        lay.addLayout(btn_row)
+
         again_btn.clicked.connect(self.restart)
+        self.cleanup_btn.clicked.connect(
+            lambda: self.cleanup_sig.emit(self._current_path))
 
     def set_info(self, path: str, count: int, excluded: int = 0,
                  tok_in: int = 0, tok_out: int = 0, mode: str = 'translate'):
+        self._current_path = path
         if mode == 'cleanup':
             self.title_lbl.setText('정리 완료!')
             self.info_lbl.setText(f'{count}개 자막 블록 삭제 완료')
+            self.cleanup_btn.setVisible(False)
         else:
             self.title_lbl.setText('번역 완료!')
             self.info_lbl.setText(
                 f'총 {count}개 자막 번역 완료'
                 + (f'  (OCR 레이블 {excluded}개 제외)' if excluded else ''))
+            self.cleanup_btn.setVisible(True)
         if tok_in or tok_out:
             self.tok_lbl.setText(
                 f'사용 토큰  입력: {tok_in:,} / 출력: {tok_out:,}  '
@@ -1165,6 +1179,7 @@ class MainWindow(QMainWindow):
         self.trans_page.cancel_sig.connect(self._cancel_translation)
         self.review_page.save_sig.connect(self._save_review)
         self.done_page.restart.connect(self._restart)
+        self.done_page.cleanup_sig.connect(self._start_cleanup_on_output)
         self.cleanup_page.apply_sig.connect(self._apply_cleanup)
         self.cleanup_page.cancel_sig.connect(lambda: self.stack.setCurrentIndex(P_SETUP))
 
@@ -1229,7 +1244,21 @@ class MainWindow(QMainWindow):
         self._cum_tok_out = 0
 
         lang_code = getattr(self.translator, 'source_lang_code', 'zh')
-        _, self._ko_path = get_output_paths(self.srt_path, lang_code)
+        origin_path, self._ko_path = get_output_paths(self.srt_path, lang_code)
+
+        # 원본 파일을 origin/ 하위 폴더로 이동 (auto-save 전에 실행)
+        src = Path(self.srt_path)
+        if src.exists():
+            origin_dir = Path(origin_path).parent
+            origin_dir.mkdir(exist_ok=True)
+            try:
+                shutil.move(str(src), origin_path)
+            except Exception as e:
+                QMessageBox.warning(
+                    self, '원본 이동 실패',
+                    f'원본 파일을 origin/ 폴더로 이동하지 못했습니다:\n{e}\n'
+                    f'번역은 계속 진행합니다.'
+                )
 
         self.trans_page.reset(total, batch_size)
         self.stack.setCurrentIndex(P_TRANS)
@@ -1261,13 +1290,7 @@ class MainWindow(QMainWindow):
 
     def _translation_done(self, results: list):
         self._trans_results = results
-        # 최종 저장
-        lang_code = getattr(self.translator, 'source_lang_code', 'zh')
-        ko_path   = self._ko_path or get_output_paths(self.srt_path, lang_code)[1]
-        src_out, _ = get_output_paths(self.srt_path, lang_code)
-        if Path(src_out).resolve() != Path(self.srt_path).resolve():
-            try: shutil.copy2(self.srt_path, src_out)
-            except Exception: pass
+        ko_path = self._ko_path
         try:
             write_ko_srt(self.srt_blocks, results, ko_path)
         except Exception as e:
@@ -1367,6 +1390,11 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(P_DONE)
 
     # ── Cleanup flow ─────────────────────────────────────────────────────────
+
+    def _start_cleanup_on_output(self, path: str):
+        """번역 완료 화면에서 '노이즈 제거' 클릭 시 — 번역 결과물을 대상으로 cleanup 실행."""
+        self.srt_path = path
+        self.start_cleanup()
 
     def start_cleanup(self):
         token = self.setup_page.token
