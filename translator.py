@@ -124,10 +124,11 @@ class SRTTranslator:
     # ── 1단계: 분석 ─────────────────────────────────────────────────────────
 
     def analyze(self, blocks: List[SubtitleBlock]) -> dict:
+        """분석 결과 dict 반환. '_tok_in', '_tok_out' 키에 토큰 수 포함."""
         sample = self._sample_blocks(blocks, 150)
         text   = '\n'.join(f"[{b.start}] {b.text}" for b in sample)
         prompt = _ANALYSIS_PROMPT.format(text=text[:25000])
-        raw = self.client._chat(
+        raw, tok_in, tok_out = self.client._chat_tracked(
             [{'role': 'system',
               'content': '당신은 자막 분석 전문가입니다. 반드시 JSON만 출력하세요.'},
              {'role': 'user', 'content': prompt}],
@@ -138,6 +139,8 @@ class SRTTranslator:
         self.work_summary     = result.get('summary', '')
         self.source_lang      = result.get('language_name', '알 수 없음')
         self.source_lang_code = result.get('language', 'zh')
+        result['_tok_in']  = tok_in
+        result['_tok_out'] = tok_out
         return result
 
     def _sample_blocks(self, blocks: List[SubtitleBlock], n: int) -> List[SubtitleBlock]:
@@ -223,7 +226,7 @@ class SRTTranslator:
         )
 
         try:
-            content, _, _ = self.client._chat_tracked(
+            content, tok_in, tok_out = self.client._chat_tracked(
                 [{'role': 'system', 'content': system},
                  {'role': 'user',   'content': user}],
                 max_tokens=MAX_OUTPUT_TOKENS,
@@ -233,10 +236,10 @@ class SRTTranslator:
             brace = content.find('{')
             if brace > 0:
                 content = content[brace:]
-            return json.loads(content.strip())
+            return json.loads(content.strip()), tok_in, tok_out
         except Exception as e:
             print(f"translate_batch error: {e}")
-            return {}
+            return {}, 0, 0
 
 
 def _strip_code_fence(text: str) -> str:

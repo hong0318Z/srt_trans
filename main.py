@@ -7,14 +7,14 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QLabel, QPushButton, QLineEdit, QTextEdit,
     QTableWidget, QTableWidgetItem, QCheckBox, QProgressBar,
     QScrollArea, QSizePolicy, QMessageBox, QFileDialog,
-    QHeaderView, QFrame, QSplitter,
+    QHeaderView, QFrame, QSplitter, QSpinBox,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QTimer
 from PyQt6.QtGui import QFont
 
 from llm_api import LLMClient
 from srt_parser import parse_srt, write_ko_srt, get_output_paths
-from translator import SRTTranslator, BATCH_SIZE
+from translator import SRTTranslator, BATCH_SIZE as DEFAULT_BATCH_SIZE
 
 # ── Stylesheet ────────────────────────────────────────────────────────────────
 
@@ -114,15 +114,18 @@ class SampleWorker(QThread):
 
 
 class TranslationWorker(QThread):
-    progress   = pyqtSignal(int, int)          # done, total
-    batch_done = pyqtSignal(int, list)         # batch_num, [(orig, trans)]
-    done       = pyqtSignal(list)
-    error      = pyqtSignal(str)
+    # (done, total), (batch_n, preview, b_tok_in, b_tok_out, cum_in, cum_out), results, partial, err
+    progress     = pyqtSignal(int, int)
+    batch_done   = pyqtSignal(int, list, int, int, int, int)
+    partial_save = pyqtSignal(list)   # partial results after each batch (for auto-save)
+    done         = pyqtSignal(list)
+    error        = pyqtSignal(str)
 
-    def __init__(self, translator, blocks):
+    def __init__(self, translator, blocks, batch_size: int = DEFAULT_BATCH_SIZE):
         super().__init__()
         self.translator = translator
         self.blocks     = blocks
+        self.batch_size = batch_size
         self._cancel    = False
 
     def cancel(self): self._cancel = True
@@ -134,19 +137,26 @@ class TranslationWorker(QThread):
             prev_ctx = []
             excluded = set(l.strip() for l in self.translator.excluded_labels)
             batch_n  = 0
+            cum_in   = 0
+            cum_out  = 0
 
-            for start in range(0, total, BATCH_SIZE):
+            for start in range(0, total, self.batch_size):
                 if self._cancel:
                     break
-                batch = self.blocks[start:start + BATCH_SIZE]
+                batch = self.blocks[start:start + self.batch_size]
 
                 to_trans = [(i, b) for i, b in enumerate(batch)
                             if b.text.strip() not in excluded]
 
-                preview = []
+                preview    = []
+                b_tok_in   = 0
+                b_tok_out  = 0
                 if to_trans:
-                    t_blocks  = [b for _, b in to_trans]
-                    trans_map = self.translator.translate_batch(t_blocks, prev_ctx)
+                    t_blocks             = [b for _, b in to_trans]
+                    trans_map, b_tok_in, b_tok_out = self.translator.translate_batch(
+                        t_blocks, prev_ctx)
+                    cum_in  += b_tok_in
+                    cum_out += b_tok_out
                     for j, (i, block) in enumerate(to_trans):
                         trans = trans_map.get(str(j + 1), block.text)
                         results[start + i] = trans
@@ -155,8 +165,9 @@ class TranslationWorker(QThread):
                             preview.append((block.text, trans))
 
                 batch_n += 1
-                self.progress.emit(min(start + BATCH_SIZE, total), total)
-                self.batch_done.emit(batch_n, preview)
+                self.progress.emit(min(start + self.batch_size, total), total)
+                self.batch_done.emit(batch_n, preview, b_tok_in, b_tok_out, cum_in, cum_out)
+                self.partial_save.emit(list(results))
 
             self.done.emit(results)
         except Exception as e:
@@ -237,6 +248,27 @@ class SetupPage(QWidget):
         file_row.addWidget(pick_btn)
         root.addLayout(file_row)
 
+        root.addSpacing(6)
+
+        # Batch size
+        root.addWidget(_label('배치 크기 (자막 수 / 회)'))
+        batch_row = QHBoxLayout()
+        self.batch_spin = QSpinBox()
+        self.batch_spin.setRange(10, 300)
+        self.batch_spin.setSingleStep(10)
+        self.batch_spin.setValue(
+            int(self.main.settings.value('batch_size', DEFAULT_BATCH_SIZE)))
+        self.batch_spin.setFixedWidth(90)
+        self.batch_spin.setStyleSheet(
+            'background:#313244; border:1px solid #45475a; border-radius:5px;'
+            'padding:4px 8px; color:#cdd6f4;')
+        batch_hint = _label('  숫자가 클수록 컨텍스트가 넓어지지만 오류 가능성↑ (권장: 50~150)')
+        batch_hint.setStyleSheet('color:#a6adc8; font-size:12px;')
+        batch_row.addWidget(self.batch_spin)
+        batch_row.addWidget(batch_hint)
+        batch_row.addStretch()
+        root.addLayout(batch_row)
+
         root.addStretch()
 
         self.start_btn = _btn('  분석 시작  →')
@@ -249,6 +281,8 @@ class SetupPage(QWidget):
         self.test_btn.clicked.connect(self._test)
         self.start_btn.clicked.connect(self.main.start_analysis)
         self.token_edit.textChanged.connect(self._check_ready)
+        self.batch_spin.valueChanged.connect(
+            lambda v: self.main.settings.setValue('batch_size', v))
 
         # Restore saved token
         saved = self.main.settings.value('token', '')
@@ -294,6 +328,9 @@ class SetupPage(QWidget):
 
     @property
     def token(self): return self.token_edit.text().strip()
+
+    @property
+    def batch_size(self): return self.batch_spin.value()
 
 
 class LoadingPage(QWidget):
@@ -375,8 +412,11 @@ class AnalysisPage(QWidget):
         info_lay = QVBoxLayout(info_card)
         lang = result.get('language_name', '알 수 없음')
         lay.addWidget(info_card)
+        tok_in  = result.get('_tok_in', 0)
+        tok_out = result.get('_tok_out', 0)
+        tok_str = f'  |  분석 토큰: IN {tok_in:,} / OUT {tok_out:,}' if tok_in else ''
         info_lay.addWidget(_label(
-            f"언어: <b>{lang}</b>  |  총 자막: <b>{total_blocks}개</b>"))
+            f"언어: <b>{lang}</b>  |  총 자막: <b>{total_blocks}개</b>{tok_str}"))
         summary = result.get('summary', '')
         if summary:
             lbl = QLabel(summary)
@@ -558,6 +598,7 @@ class TranslatingPage(QWidget):
     def _build(self):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(40, 24, 40, 24)
+        lay.setSpacing(10)
         lay.addWidget(_label('번역 중...', 'title'))
 
         self.status_lbl = _label('준비 중...')
@@ -568,6 +609,21 @@ class TranslatingPage(QWidget):
         self.bar.setMinimumHeight(20)
         lay.addWidget(self.bar)
 
+        # Token usage panel
+        tok_card = QFrame()
+        tok_card.setObjectName('card')
+        tok_lay = QHBoxLayout(tok_card)
+        tok_lay.setContentsMargins(12, 8, 12, 8)
+        self.tok_batch_lbl = QLabel('현재 배치  IN — / OUT —')
+        self.tok_cum_lbl   = QLabel('누적 합계  IN — / OUT —')
+        self.tok_batch_lbl.setStyleSheet('color:#89dceb; font-size:12px; font-family:monospace;')
+        self.tok_cum_lbl.setStyleSheet('color:#a6e3a1; font-size:12px; font-family:monospace;')
+        tok_lay.addWidget(self.tok_batch_lbl)
+        tok_lay.addSpacing(30)
+        tok_lay.addWidget(self.tok_cum_lbl)
+        tok_lay.addStretch()
+        lay.addWidget(tok_card)
+
         lay.addWidget(_label('최근 완료 배치 미리보기:', 'section'))
         self.preview = QTextEdit()
         self.preview.setReadOnly(True)
@@ -577,24 +633,35 @@ class TranslatingPage(QWidget):
         cancel_btn = _btn('취소', 'danger')
         lay.addWidget(cancel_btn, alignment=Qt.AlignmentFlag.AlignRight)
         cancel_btn.clicked.connect(self.cancel_sig)
+        self._batch_size = DEFAULT_BATCH_SIZE
 
-    def reset(self, total: int):
+    def reset(self, total: int, batch_size: int = DEFAULT_BATCH_SIZE):
+        self._batch_size = batch_size
         self.bar.setMaximum(total)
         self.bar.setValue(0)
         self.preview.clear()
         self.status_lbl.setText('번역 시작 중...')
+        self.tok_batch_lbl.setText('현재 배치  IN — / OUT —')
+        self.tok_cum_lbl.setText('누적 합계  IN — / OUT —')
 
     def update_progress(self, done: int, total: int):
         self.bar.setValue(done)
-        batches_done = (done + BATCH_SIZE - 1) // BATCH_SIZE
-        batches_total = (total + BATCH_SIZE - 1) // BATCH_SIZE
+        bs = self._batch_size
+        batches_done  = (done + bs - 1) // bs
+        batches_total = (total + bs - 1) // bs
         self.status_lbl.setText(
             f'배치 {batches_done} / {batches_total}  ({done} / {total} 자막)')
 
-    def append_preview(self, batch_num: int, preview: list):
+    def append_preview(self, batch_num: int, preview: list,
+                       b_in: int, b_out: int, cum_in: int, cum_out: int):
+        self.tok_batch_lbl.setText(
+            f'현재 배치  IN {b_in:,} / OUT {b_out:,} tokens')
+        self.tok_cum_lbl.setText(
+            f'누적 합계  IN {cum_in:,} / OUT {cum_out:,} tokens')
         if not preview:
             return
-        self.preview.append(f'\n── 배치 {batch_num} 완료 ──')
+        self.preview.append(f'\n── 배치 {batch_num} 완료  '
+                            f'(IN {b_in:,} / OUT {b_out:,}) ──')
         for orig, trans in preview:
             self.preview.append(f'원: {orig}')
             self.preview.append(f'번: {trans}')
@@ -617,6 +684,11 @@ class DonePage(QWidget):
         self.info_lbl.setStyleSheet('color:#a6e3a1; font-size:14px; margin:16px 0;')
         self.info_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(self.info_lbl)
+        self.tok_lbl = QLabel('')
+        self.tok_lbl.setStyleSheet(
+            'color:#89dceb; font-size:12px; font-family:monospace; margin:4px 0;')
+        self.tok_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self.tok_lbl)
         self.path_lbl = QLabel('')
         self.path_lbl.setWordWrap(True)
         self.path_lbl.setStyleSheet('color:#a6adc8; font-size:12px;')
@@ -627,10 +699,15 @@ class DonePage(QWidget):
         lay.addWidget(again_btn, alignment=Qt.AlignmentFlag.AlignCenter)
         again_btn.clicked.connect(self.restart)
 
-    def set_info(self, ko_path: str, translated: int, excluded: int):
+    def set_info(self, ko_path: str, translated: int, excluded: int,
+                 total_tok_in: int = 0, total_tok_out: int = 0):
         self.info_lbl.setText(
             f'총 {translated}개 자막 번역 완료'
             + (f'  (OCR 레이블 {excluded}개 제외)' if excluded else ''))
+        if total_tok_in or total_tok_out:
+            self.tok_lbl.setText(
+                f'사용 토큰  입력: {total_tok_in:,} / 출력: {total_tok_out:,}  '
+                f'(합계: {total_tok_in + total_tok_out:,})')
         self.path_lbl.setText(f'저장 위치:\n{ko_path}')
 
 
@@ -645,6 +722,9 @@ class MainWindow(QMainWindow):
         self.translator  = None
         self._worker     = None
         self._trans_results: list[str] = []
+        self._ko_path    = ''
+        self._cum_tok_in  = 0
+        self._cum_tok_out = 0
 
         self.setWindowTitle('SRT 한국어 번역기')
         self.setMinimumSize(900, 640)
@@ -739,16 +819,38 @@ class MainWindow(QMainWindow):
 
     def _begin_translation(self):
         self._collect_settings()
-        total = len(self.srt_blocks)
-        self.translating_page.reset(total)
+        total      = len(self.srt_blocks)
+        batch_size = self.setup_page.batch_size
+        self._cum_tok_in  = 0
+        self._cum_tok_out = 0
+
+        # Determine output path now so auto-save can use it
+        lang_code = getattr(self.translator, 'source_lang_code', 'zh')
+        _, self._ko_path = get_output_paths(self.srt_path, lang_code)
+
+        self.translating_page.reset(total, batch_size)
         self.stack.setCurrentIndex(4)
 
-        self._worker = TranslationWorker(self.translator, self.srt_blocks)
+        self._worker = TranslationWorker(self.translator, self.srt_blocks, batch_size)
         self._worker.progress.connect(self.translating_page.update_progress)
-        self._worker.batch_done.connect(self.translating_page.append_preview)
+        self._worker.batch_done.connect(self._on_batch_done)
+        self._worker.partial_save.connect(self._auto_save)
         self._worker.done.connect(self._translation_done)
         self._worker.error.connect(self._translation_error)
         self._worker.start()
+
+    def _on_batch_done(self, batch_n, preview, b_in, b_out, cum_in, cum_out):
+        self._cum_tok_in  = cum_in
+        self._cum_tok_out = cum_out
+        self.translating_page.append_preview(batch_n, preview, b_in, b_out, cum_in, cum_out)
+
+    def _auto_save(self, partial: list):
+        if not self._ko_path or not self.srt_blocks:
+            return
+        try:
+            write_ko_srt(self.srt_blocks, partial, self._ko_path)
+        except Exception:
+            pass
 
     def _cancel_translation(self):
         if self._worker:
@@ -757,12 +859,11 @@ class MainWindow(QMainWindow):
 
     def _translation_done(self, results: list):
         self._trans_results = results
-        excluded_count = sum(1 for r in results if r == '')
+        excluded_count   = sum(1 for r in results if r == '')
         translated_count = len(results) - excluded_count
 
-        # Determine output paths
         lang_code = getattr(self.translator, 'source_lang_code', 'zh')
-        _, ko_path = get_output_paths(self.srt_path, lang_code)
+        ko_path   = self._ko_path or get_output_paths(self.srt_path, lang_code)[1]
 
         # Copy source file if needed
         src_out, _ = get_output_paths(self.srt_path, lang_code)
@@ -772,7 +873,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        # Write Korean SRT
+        # Final write (auto-save already wrote it, this is the authoritative final write)
         try:
             write_ko_srt(self.srt_blocks, results, ko_path)
         except Exception as e:
@@ -780,7 +881,9 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentIndex(0)
             return
 
-        self.done_page.set_info(ko_path, translated_count, excluded_count)
+        self.done_page.set_info(
+            ko_path, translated_count, excluded_count,
+            self._cum_tok_in, self._cum_tok_out)
         self.stack.setCurrentIndex(5)
 
     def _translation_error(self, err: str):
