@@ -178,6 +178,10 @@ class SRTTranslator:
         lines = [ln.strip() for ln in result.splitlines() if ln.strip()]
         return '\n'.join(lines)
 
+    def is_translatable(self, block: SubtitleBlock) -> bool:
+        """레이블 제거 후 번역할 텍스트가 남아있는 블록인지 확인."""
+        return bool(self._strip_labels(block.text).strip())
+
     # ── 샘플 번역 ────────────────────────────────────────────────────────────
 
     def translate_sample(self, blocks: List[SubtitleBlock], n: int = 5) -> str:

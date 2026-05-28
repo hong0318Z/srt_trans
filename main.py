@@ -620,10 +620,11 @@ class TranslatingPage(QWidget):
         lay.addWidget(cancel_btn, alignment=Qt.AlignmentFlag.AlignRight)
         cancel_btn.clicked.connect(self.cancel_sig)
 
-    def reset(self, total: int, batch_size: int = DEFAULT_BATCH_SIZE):
+    def reset(self, total: int, batch_size: int = DEFAULT_BATCH_SIZE,
+              label: str = '번역 시작 중...'):
         self._batch_size = batch_size
         self.bar.setMaximum(total); self.bar.setValue(0)
-        self.preview.clear(); self.status_lbl.setText('번역 시작 중...')
+        self.preview.clear(); self.status_lbl.setText(label)
         self.tok_batch_lbl.setText('현재 배치  IN — / OUT —')
         self.tok_cum_lbl.setText('누적 합계  IN — / OUT —')
 
@@ -1012,6 +1013,9 @@ class MissingPage(QWidget):
         self._dir2 = ''
         self.dir2_lbl.setText('선택 안 됨 (원본과 같은 디렉토리)')
 
+    _VIDEO_EXTS = {'.mkv', '.mp4', '.avi', '.mov', '.wmv',
+                   '.ts', '.m2ts', '.flv', '.webm', '.mpg', '.mpeg'}
+
     def _search(self):
         if not self._dir1:
             QMessageBox.warning(self, '알림', '원본 디렉토리를 선택하세요.')
@@ -1019,42 +1023,89 @@ class MissingPage(QWidget):
 
         p1 = Path(self._dir1)
         p2 = Path(self._dir2) if self._dir2 else None
+        recursive = self.recursive_cb.isChecked()
+        pattern   = '**/*' if recursive else '*'
 
-        pattern = '**/*.srt' if self.recursive_cb.isChecked() else '*.srt'
-        all_srt  = sorted(p1.glob(pattern))
+        # ── 1) SRT 파일 수집 ──────────────────────────────────────────────────
+        all_srt = sorted(
+            f for f in p1.glob('**/*.srt' if recursive else '*.srt')
+        )
 
-        missing = []
+        # .ko.srt 가 없는 원본 SRT
+        missing_ko = []
         for srt in all_srt:
-            # .ko.srt 는 번역 결과물이므로 원본 목록에서 제외
             if srt.stem.lower().endswith('.ko'):
                 continue
-
-            base = self._base_name(srt.stem)
-
-            # 같은 위치에 .ko.srt 존재 여부 확인
+            base      = self._base_name(srt.stem)
             rel       = srt.relative_to(p1)
             same_dir  = srt.parent / f"{base}.ko.srt"
-
             if p2:
-                # dir2 에서 같은 상대 경로 우선, 그 다음 flat 탐색
                 trans_rel  = p2 / rel.parent / f"{base}.ko.srt"
                 trans_flat = p2 / f"{base}.ko.srt"
                 found = same_dir.exists() or trans_rel.exists() or trans_flat.exists()
             else:
                 found = same_dir.exists()
-
             if not found:
-                missing.append(str(srt))
+                missing_ko.append(str(srt))
 
+        # ── 2) 자막 자체가 없는 동영상 파일 ─────────────────────────────────
+        # Dir 1 전체 파일에서 비디오 확장자 탐색
+        all_videos = sorted(
+            f for f in p1.glob(pattern)
+            if f.is_file() and f.suffix.lower() in self._VIDEO_EXTS
+        )
+        no_sub = []
+        for vid in all_videos:
+            base     = self._base_name(vid.stem)
+            vid_dir  = vid.parent
+
+            # 같은 폴더 안에 어떤 .srt 든 존재하면 OK
+            def srt_exists_local():
+                for tag in ('', '.zh', '.en', '.ja', '.cn', '.chs', '.cht',
+                            '.ko', '.sc', '.tc', '.chi', '.jpn', '.eng'):
+                    if (vid_dir / f"{base}{tag}.srt").exists():
+                        return True
+                return False
+
+            def srt_exists_dir2():
+                if not p2:
+                    return False
+                rel_parent = vid.relative_to(p1).parent
+                for tag in ('', '.zh', '.en', '.ja', '.cn', '.chs', '.cht',
+                            '.ko', '.sc', '.tc', '.chi', '.jpn', '.eng'):
+                    if (p2 / rel_parent / f"{base}{tag}.srt").exists():
+                        return True
+                    if (p2 / f"{base}{tag}.srt").exists():
+                        return True
+                return False
+
+            if not srt_exists_local() and not srt_exists_dir2():
+                no_sub.append(str(vid))
+
+        # ── 결과 표시 ─────────────────────────────────────────────────────────
         self.list_edit.clear()
-        if missing:
-            self.result_lbl.setText(
-                f'미번역 파일: {len(missing)}개  /  전체 스캔: {len(all_srt)}개')
-            self.list_edit.setPlainText('\n'.join(missing))
+        parts = []
+        if no_sub:
+            parts.append(
+                f'■ 자막 없음 ({len(no_sub)}개) — 동영상에 .srt 파일 없음\n'
+                + '\n'.join(no_sub)
+            )
+        if missing_ko:
+            parts.append(
+                f'■ 미번역 ({len(missing_ko)}개) — .ko.srt 없음\n'
+                + '\n'.join(missing_ko)
+            )
+
+        srt_src_count = sum(1 for s in all_srt
+                            if not s.stem.lower().endswith('.ko'))
+        self.result_lbl.setText(
+            f'자막 없음: {len(no_sub)}개  /  미번역: {len(missing_ko)}개'
+            f'  /  동영상 스캔: {len(all_videos)}개  /  SRT 스캔: {srt_src_count}개'
+        )
+        if parts:
+            self.list_edit.setPlainText('\n\n'.join(parts))
         else:
-            self.result_lbl.setText(
-                f'모든 파일에 번역본이 존재합니다.  (스캔: {len(all_srt)}개)')
-            self.list_edit.setPlainText('(미번역 파일 없음)')
+            self.list_edit.setPlainText('(모든 동영상에 자막·번역본이 존재합니다)')
 
     @staticmethod
     def _base_name(stem: str) -> str:
@@ -1082,6 +1133,7 @@ class MainWindow(QMainWindow):
         self._ko_path      = ''
         self._cum_tok_in   = 0
         self._cum_tok_out  = 0
+        self._missing_original_indices: list = []
 
         self.setWindowTitle('SRT 한국어 번역기')
         self.setMinimumSize(960, 660)
@@ -1222,9 +1274,77 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, '저장 실패', f'파일 저장 실패:\n{e}')
             self.stack.setCurrentIndex(P_SETUP); return
 
-        # → 교정 테이블로 이동
+        self._validate_and_proceed()
+
+    def _validate_and_proceed(self):
+        """번역 수량 검증 후 누락이 있으면 재번역 여부 물음. 통과하면 교정 테이블로."""
+        results = self._trans_results
+        blocks  = self.srt_blocks
+
+        missing_indices = [
+            i for i, (b, r) in enumerate(zip(blocks, results))
+            if self.translator.is_translatable(b) and not r
+        ]
+
+        if missing_indices:
+            total      = len(blocks)
+            translated = sum(1 for r in results if r)
+            excluded   = sum(1 for b in blocks
+                             if not self.translator.is_translatable(b))
+            msg = (
+                f"번역 누락 {len(missing_indices)}개가 발견되었습니다.\n\n"
+                f"  전체 블록:   {total}개\n"
+                f"  번역 완료:   {translated}개\n"
+                f"  OCR 제외:    {excluded}개\n"
+                f"  누락:        {len(missing_indices)}개\n\n"
+                f"배치 크기가 너무 크면 LLM 출력이 잘려 누락이 생길 수 있습니다.\n"
+                f"누락된 블록만 재번역하시겠습니까?"
+            )
+            reply = QMessageBox.question(
+                self, '번역 검증', msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._retranslate_missing(missing_indices)
+                return
+
         self.review_page.populate(self.srt_blocks, results)
         self.stack.setCurrentIndex(P_REVIEW)
+
+    def _retranslate_missing(self, missing_indices: list):
+        """누락 인덱스 블록만 골라 재번역 워커 시작."""
+        self._missing_original_indices = missing_indices
+        missing_blocks = [self.srt_blocks[i] for i in missing_indices]
+        batch_size     = self.setup_page.batch_size
+
+        self.trans_page.reset(
+            len(missing_blocks), batch_size,
+            f'누락 {len(missing_blocks)}개 재번역 중...',
+        )
+        self.stack.setCurrentIndex(P_TRANS)
+
+        self._worker = TranslationWorker(self.translator, missing_blocks, batch_size)
+        self._worker.progress.connect(self.trans_page.update_progress)
+        self._worker.batch_done.connect(self._on_batch_done)
+        self._worker.done.connect(self._retrans_done)
+        self._worker.error.connect(self._translation_error)
+        self._worker.start()
+
+    def _retrans_done(self, new_results: list):
+        """재번역 결과를 기존 결과에 병합 후 재저장 → 재검증."""
+        for orig_idx, trans in zip(self._missing_original_indices, new_results):
+            if trans:
+                self._trans_results[orig_idx] = trans
+
+        lang_code = getattr(self.translator, 'source_lang_code', 'zh')
+        ko_path   = self._ko_path or get_output_paths(self.srt_path, lang_code)[1]
+        try:
+            write_ko_srt(self.srt_blocks, self._trans_results, ko_path)
+        except Exception as e:
+            QMessageBox.critical(self, '저장 실패', f'파일 저장 실패:\n{e}'); return
+
+        self._validate_and_proceed()
 
     def _translation_error(self, err: str):
         QMessageBox.critical(self, '번역 오류', f'번역 중 오류:\n{err}')
