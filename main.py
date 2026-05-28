@@ -398,19 +398,24 @@ class AnalysisPage(QWidget):
                 QHeaderView.ResizeMode.Stretch)
             self.noun_table.verticalHeader().setVisible(False)
             self.noun_table.setMinimumHeight(min(len(nouns) * 34 + 36, 260))
+            self.noun_table.setRowHeight(0, 36)
             for r, noun in enumerate(nouns):
                 orig      = noun.get('original', '')
                 ctx       = noun.get('context', '')
                 suggested = noun.get('suggested', '')
+                self.noun_table.setRowHeight(r, 36)
                 for c, val in enumerate([orig, ctx, suggested]):
                     item = QTableWidgetItem(val)
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                    item.setForeground(
-                        QTableWidget().palette().color(
-                            QTableWidget().foregroundRole()))
                     self.noun_table.setItem(r, c, item)
-                edit_item = QTableWidgetItem('')  # editable
-                self.noun_table.setItem(r, 3, edit_item)
+                # QLineEdit으로 입력칸을 명확하게 표시
+                le = QLineEdit()
+                le.setPlaceholderText('직접 입력...')
+                le.setStyleSheet(
+                    'background:#1e1e2e; border:1px solid #89b4fa;'
+                    'border-radius:3px; padding:2px 8px; color:#cdd6f4;'
+                    'margin:3px;')
+                self.noun_table.setCellWidget(r, 3, le)
             lay.addWidget(self.noun_table)
         else:
             self.noun_table = QTableWidget(0, 4)
@@ -483,7 +488,8 @@ class AnalysisPage(QWidget):
         for r in range(table.rowCount()):
             orig      = (table.item(r, 0) or QTableWidgetItem()).text()
             suggested = (table.item(r, 2) or QTableWidgetItem()).text()
-            user_val  = (table.item(r, 3) or QTableWidgetItem()).text().strip()
+            widget    = table.cellWidget(r, 3)
+            user_val  = widget.text().strip() if isinstance(widget, QLineEdit) else ''
             final     = user_val or suggested
             if orig and final:
                 result[orig] = final
